@@ -1,0 +1,600 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>AIUBE JS Run</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      background: #111;
+      font-family: sans-serif;
+    }
+
+    #gameCanvas {
+      position: fixed;
+      inset: 0;
+      width: 100vw;
+      height: 100vh;
+      background: #1b1b1b;
+    }
+
+    #webcamPreview {
+      position: fixed;
+      top: max(20px, env(safe-area-inset-top));
+      left: 20px;
+      transform: scaleX(-1);
+      width: 22vw;
+      max-width: 160px;
+      border: 2px solid white;
+      border-radius: 8px;
+      z-index: 10;
+      background: black;
+    }
+
+    #debugText {
+      position: fixed;
+      top: 180px;
+      left: 20px;
+      right: 20px;
+      color: white;
+      background: rgba(0,0,0,0.75);
+      padding: 10px;
+      border-radius: 8px;
+      font-size: 13px;
+      line-height: 1.5;
+      white-space: pre-line;
+      z-index: 10;
+      display: none;
+    }
+  </style>
+</head>
+
+<body>
+  <canvas id="gameCanvas"></canvas>
+  <video id="webcamPreview" autoplay muted playsinline></video>
+  <div id="debugText"></div>
+
+  <script type="module">
+    import {
+      FaceLandmarker,
+      FilesetResolver
+    } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/vision_bundle.mjs";
+
+    // ==================================================
+    // Canvas
+    // ==================================================
+    const canvas = document.getElementById("gameCanvas");
+    const ctx = canvas.getContext("2d");
+
+    function resizeCanvas() {
+      canvas.width = window.innerWidth;
+      canvas.height = window.innerHeight;
+    }
+
+    window.addEventListener("resize", resizeCanvas);
+    resizeCanvas();
+
+    // ==================================================
+    // MediaPipe
+    // ==================================================
+    let faceLandmarker;
+    const video = document.getElementById("webcamPreview");
+    const debugText = document.getElementById("debugText");
+    let lastVideoTime = -1;
+
+    let jaw = 0;
+    let smile = 0;
+    let pucker = 0;
+
+    async function initMediaPipe() {
+      const vision = await FilesetResolver.forVisionTasks(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/wasm"
+      );
+
+      faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
+        baseOptions: {
+          modelAssetPath:
+            "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task"
+        },
+        runningMode: "VIDEO",
+        numFaces: 1,
+        outputFaceBlendshapes: true
+      });
+
+      console.log("[MediaPipe] OK");
+    }
+
+    async function initCamera() {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        throw new Error("getUserMedia is not available. Use HTTPS on mobile browsers.");
+      }
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: "user" },
+        audio: false
+      });
+
+      video.srcObject = stream;
+
+      video.onloadeddata = () => {
+        console.log("[Camera] OK");
+        requestAnimationFrame(mainLoop);
+      };
+    }
+
+    function updateMouthValues() {
+      if (!faceLandmarker || video.readyState < 2) return;
+
+      if (video.currentTime === lastVideoTime) return;
+      lastVideoTime = video.currentTime;
+
+      const result = faceLandmarker.detectForVideo(video, performance.now());
+
+      if (!result.faceBlendshapes || result.faceBlendshapes.length === 0) {
+        jaw = 0;
+        smile = 0;
+        pucker = 0;
+        return;
+      }
+
+      const list = result.faceBlendshapes[0].categories;
+
+      let smileL = 0;
+      let smileR = 0;
+
+      jaw = 0;
+      pucker = 0;
+
+      for (const b of list) {
+        if (b.categoryName === "jawOpen") jaw = b.score;
+        if (b.categoryName === "mouthSmileLeft") smileL = b.score;
+        if (b.categoryName === "mouthSmileRight") smileR = b.score;
+        if (b.categoryName === "mouthPucker") pucker = b.score;
+      }
+
+      smile = Math.max(smileL, smileR);
+    }
+
+    // ==================================================
+    // Game Settings
+    // ==================================================
+    const settings = {
+      totalSets: 40,
+      spawnInterval: 2.0,
+      startDelay: 5.0,
+
+      blockMode: "BlockTwoLanes",
+      // "BlockTwoLanes" or "BlockThreeLanes"
+
+      lanePattern: [0, 1, 2, 3],
+
+      beJawThreshold: 0.30,
+      beSmileThreshold: 0.50,
+      bePuckerBlockThreshold: 0.20,
+      beHoldTime: 0.18,
+
+      mouthDeadZone: 0.12,
+
+      playerMoveSpeed: 12,
+      obstacleSpeed: 280,
+
+      coinCountPerSet: 3
+    };
+
+    const laneColors = [
+      "#0072B2", // A
+      "#D55E00", // I
+      "#F0E442", // U
+      "#8A5FD3"  // BE
+    ];
+
+    const laneLabels = ["A", "I", "U", "BE"];
+
+    // ==================================================
+    // Game State
+    // ==================================================
+    let gameState = "playing";
+
+    let playerLane = 0;
+    let playerX = 0;
+    let targetPlayerX = 0;
+    let currentMouthState = "";
+
+    let beTimer = 0;
+
+    let elapsed = 0;
+    let spawnTimer = -settings.startDelay;
+    let spawnedCount = 0;
+    let judgedCount = 0;
+
+    let successCount = 0;
+    let hitCount = 0;
+    let coinCount = 0;
+
+    let lanePatternIndex = 0;
+
+    const obstacleSets = [];
+    const coins = [];
+
+    let lastTime = performance.now();
+
+    // ==================================================
+    // Utility
+    // ==================================================
+    function getLaneX(index) {
+      const w = canvas.width;
+      const margin = w * 0.12;
+      const usable = w - margin * 2;
+      const gap = usable / 3;
+
+      return margin + gap * index;
+    }
+
+    function getSafeLane() {
+      const lane = settings.lanePattern[lanePatternIndex];
+      lanePatternIndex++;
+
+      if (lanePatternIndex >= settings.lanePattern.length) {
+        lanePatternIndex = 0;
+      }
+
+      return Math.max(0, Math.min(3, lane));
+    }
+
+    function setPlayerLane(lane, state) {
+      playerLane = lane;
+      targetPlayerX = getLaneX(lane);
+      currentMouthState = state;
+    }
+
+    // ==================================================
+    // Mouth Detection
+    // ==================================================
+    function updateMouthState(dt) {
+      const beCondition =
+        jaw > settings.beJawThreshold &&
+        smile > settings.beSmileThreshold &&
+        pucker < settings.bePuckerBlockThreshold &&
+        jaw > smile * 0.85;
+
+      if (beCondition) {
+        beTimer += dt;
+      } else {
+        beTimer = 0;
+      }
+
+      const max = Math.max(jaw, smile, pucker);
+
+      if (beTimer >= settings.beHoldTime) {
+        setPlayerLane(3, "BE");
+        return;
+      }
+
+      if (max < settings.mouthDeadZone) {
+        currentMouthState = "";
+        return;
+      }
+
+      if (jaw >= smile && jaw >= pucker) {
+        setPlayerLane(0, "A");
+      } else if (smile >= jaw && smile >= pucker) {
+        setPlayerLane(1, "I");
+      } else {
+        setPlayerLane(2, "U");
+      }
+    }
+
+    // ==================================================
+    // Spawn
+    // ==================================================
+    function spawnObstacleSet() {
+      const safeLane = getSafeLane();
+
+      const blockCount =
+        settings.blockMode === "BlockThreeLanes" ? 3 : 2;
+
+      const candidates = [];
+
+      for (let i = 0; i < 4; i++) {
+        if (i !== safeLane) candidates.push(i);
+      }
+
+      // shuffle
+      for (let i = candidates.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [candidates[i], candidates[j]] = [candidates[j], candidates[i]];
+      }
+
+      const blockedLanes = candidates.slice(0, blockCount);
+
+      obstacleSets.push({
+        y: -120,
+        safeLane,
+        blockedLanes,
+        judged: false,
+        hit: false
+      });
+
+      for (let i = 0; i < settings.coinCountPerSet; i++) {
+        coins.push({
+          lane: safeLane,
+          y: -260 - i * 45,
+          collected: false
+        });
+      }
+    }
+
+    // ==================================================
+    // Update Game
+    // ==================================================
+    function updateGame(dt) {
+      if (gameState !== "playing") return;
+
+      elapsed += dt;
+      spawnTimer += dt;
+
+      if (spawnedCount < settings.totalSets &&
+          spawnTimer >= settings.spawnInterval) {
+        spawnTimer = 0;
+        spawnObstacleSet();
+        spawnedCount++;
+      }
+
+      updateMouthState(dt);
+
+      playerX +=
+        (targetPlayerX - playerX) *
+        Math.min(1, dt * settings.playerMoveSpeed);
+
+      const playerY = canvas.height * 0.82;
+
+      // obstacles
+      for (const set of obstacleSets) {
+        set.y += settings.obstacleSpeed * dt;
+
+        if (!set.judged) {
+          for (const lane of set.blockedLanes) {
+            const ox = getLaneX(lane);
+            const oy = set.y;
+
+            const hit =
+              Math.abs(playerX - ox) < 40 &&
+              Math.abs(playerY - oy) < 45;
+
+            if (hit) {
+              set.hit = true;
+              set.judged = true;
+              hitCount++;
+              judgedCount++;
+              break;
+            }
+          }
+
+          if (!set.judged && set.y > playerY + 70) {
+            set.judged = true;
+            successCount++;
+            judgedCount++;
+          }
+        }
+      }
+
+      // coins
+      for (const coin of coins) {
+        coin.y += settings.obstacleSpeed * dt;
+
+        if (!coin.collected) {
+          const cx = getLaneX(coin.lane);
+          const cy = coin.y;
+
+          const hit =
+            Math.abs(playerX - cx) < 45 &&
+            Math.abs(playerY - cy) < 45;
+
+          if (hit) {
+            coin.collected = true;
+            coinCount++;
+          }
+        }
+      }
+
+      if (judgedCount >= settings.totalSets) {
+        gameState = "result";
+      }
+    }
+
+    // ==================================================
+    // Draw
+    // ==================================================
+    function drawGame() {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      drawLanes();
+      drawObjects();
+      drawPlayer();
+      drawUI();
+
+      if (gameState === "result") {
+        drawResult();
+      }
+    }
+
+    function drawLanes() {
+      const h = canvas.height;
+      const top = 0;
+      const bottom = h;
+
+      for (let i = 0; i < 4; i++) {
+        const x = getLaneX(i);
+        const laneW = canvas.width * 0.18;
+
+        ctx.fillStyle = laneColors[i];
+        ctx.globalAlpha = 0.25;
+        ctx.fillRect(x - laneW / 2, top, laneW, bottom);
+        ctx.globalAlpha = 1;
+
+        ctx.strokeStyle = laneColors[i];
+        ctx.lineWidth = 4;
+        ctx.strokeRect(x - laneW / 2, top, laneW, bottom);
+
+        ctx.fillStyle = "white";
+        ctx.strokeStyle = "black";
+        ctx.lineWidth = 5;
+        ctx.font = "bold 36px sans-serif";
+        ctx.textAlign = "center";
+        ctx.strokeText(laneLabels[i], x, h - 35);
+        ctx.fillText(laneLabels[i], x, h - 35);
+      }
+    }
+
+    function drawObjects() {
+      // obstacles
+      for (const set of obstacleSets) {
+        if (set.y > canvas.height + 100) continue;
+
+        for (const lane of set.blockedLanes) {
+          const x = getLaneX(lane);
+
+          ctx.fillStyle = "#222";
+          ctx.strokeStyle = "white";
+          ctx.lineWidth = 3;
+
+          ctx.fillRect(x - 35, set.y - 35, 70, 70);
+          ctx.strokeRect(x - 35, set.y - 35, 70, 70);
+        }
+      }
+
+      // coins
+      for (const coin of coins) {
+        if (coin.collected) continue;
+        if (coin.y > canvas.height + 50) continue;
+
+        const x = getLaneX(coin.lane);
+
+        ctx.fillStyle = "#FFD700";
+        ctx.strokeStyle = "black";
+        ctx.lineWidth = 3;
+
+        ctx.beginPath();
+        ctx.arc(x, coin.y, 16, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+      }
+    }
+
+    function drawPlayer() {
+      const y = canvas.height * 0.82;
+
+      ctx.fillStyle = "#ffffff";
+      ctx.strokeStyle = "black";
+      ctx.lineWidth = 4;
+
+      ctx.beginPath();
+      ctx.arc(playerX, y, 28, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+
+      ctx.fillStyle = "black";
+      ctx.font = "bold 22px sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText(currentMouthState, playerX, y + 8);
+    }
+
+    function drawUI() {
+      ctx.textAlign = "right";
+      ctx.font = "bold 24px sans-serif";
+      ctx.fillStyle = "white";
+      ctx.strokeStyle = "black";
+      ctx.lineWidth = 4;
+
+      const x = canvas.width - 20;
+      let y = 40;
+
+      const lines = [
+        `Avoid : ${successCount}/${settings.totalSets}`,
+        `Hit : ${hitCount}`,
+        `Coins : ${coinCount}`,
+        `Mouth : ${currentMouthState}`
+      ];
+
+      for (const line of lines) {
+        ctx.strokeText(line, x, y);
+        ctx.fillText(line, x, y);
+        y += 34;
+      }
+    }
+
+    function drawResult() {
+      ctx.fillStyle = "rgba(0,0,0,0.75)";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+      ctx.textAlign = "center";
+      ctx.fillStyle = "white";
+      ctx.strokeStyle = "black";
+      ctx.lineWidth = 5;
+
+      ctx.font = "bold 42px sans-serif";
+      ctx.strokeText("RESULT", canvas.width / 2, canvas.height / 2 - 100);
+      ctx.fillText("RESULT", canvas.width / 2, canvas.height / 2 - 100);
+
+      ctx.font = "bold 28px sans-serif";
+
+      const lines = [
+        `Score : ${successCount}/${settings.totalSets}`,
+        `Hit : ${hitCount}`,
+        `Coins : ${coinCount}`
+      ];
+
+      let y = canvas.height / 2 - 30;
+
+      for (const line of lines) {
+        ctx.strokeText(line, canvas.width / 2, y);
+        ctx.fillText(line, canvas.width / 2, y);
+        y += 45;
+      }
+    }
+
+    // ==================================================
+    // Main Loop
+    // ==================================================
+    function mainLoop(now) {
+      const dt = Math.min(0.05, (now - lastTime) / 1000);
+      lastTime = now;
+
+      updateMouthValues();
+      updateGame(dt);
+      drawGame();
+
+      requestAnimationFrame(mainLoop);
+    }
+
+    function showError(error) {
+      console.error(error);
+      drawGame();
+      debugText.style.display = "block";
+      debugText.innerText =
+        "Error:\n" +
+        (error && error.message ? error.message : String(error)) +
+        "\n\nスマホのカメラは HTTPS か localhost でないと起動できないことがあります。";
+    }
+
+    // ==================================================
+    // Start
+    // ==================================================
+    window.addEventListener("load", async () => {
+      playerX = getLaneX(0);
+      targetPlayerX = playerX;
+
+      try {
+        await initMediaPipe();
+        await initCamera();
+      } catch (error) {
+        showError(error);
+      }
+    });
+  </script>
+</body>
+</html>
