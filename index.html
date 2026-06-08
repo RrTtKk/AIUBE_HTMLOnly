@@ -85,6 +85,10 @@
       font-weight: bold;
     }
 
+    #experimentPanel button.modeButton {
+      background: #004b7a;
+    }
+
     #experimentStatus {
       position: fixed;
       left: 12px;
@@ -149,6 +153,8 @@
   <div id="experimentStatus">記録停止中</div>
   <div id="experimentPanel">
     <input id="participantInput" value="P01" aria-label="participant">
+    <button class="modeButton" onclick="setGameMode()">ゲーム</button>
+    <button class="modeButton" onclick="setEvaluationMode()">評価</button>
     <button onclick="startExperiment('A')">A開始</button>
     <button onclick="startExperiment('I')">I開始</button>
     <button onclick="startExperiment('U')">U開始</button>
@@ -288,6 +294,13 @@
       coinCountPerSet: 3
     };
 
+    // ==================================================
+    // Mode
+    // ==================================================
+    // game: 通常ゲームモード（障害物・コイン・40個終了）
+    // evaluation: 口形認識評価モード（障害物なし・時間無制限・口形移動のみ）
+    let currentMode = "game";
+
 
     // ==================================================
     // Experiment Logging / Google Sheets
@@ -386,11 +399,58 @@
       if (!experimentStatus) return;
 
       const state = experiment.isRecording ? "記録中" : "記録停止中";
-      const line1 = `${state} / Target: ${experiment.targetMouth} / Rows: ${experiment.rows.length}`;
+      const modeLabel = currentMode === "evaluation" ? "評価" : "ゲーム";
+      const line1 = `${state} / Mode: ${modeLabel} / Target: ${experiment.targetMouth} / Rows: ${experiment.rows.length}`;
       experimentStatus.innerText = message ? `${line1}\n${message}` : line1;
     }
 
+    function resetGameState() {
+      obstacleSets.length = 0;
+      coins.length = 0;
+
+      successCount = 0;
+      hitCount = 0;
+      coinCount = 0;
+
+      spawnedCount = 0;
+      judgedCount = 0;
+
+      elapsed = 0;
+      spawnTimer = -settings.startDelay;
+      lanePatternIndex = 0;
+
+      gameState = "playing";
+    }
+
+    function setGameMode() {
+      if (experiment.isRecording) {
+        alert("記録中はモードを変更できません。先に停止してください。");
+        return;
+      }
+
+      currentMode = "game";
+      resetGameState();
+      updateExperimentStatus("ゲームモード：障害物あり");
+    }
+
+    function setEvaluationMode() {
+      if (experiment.isRecording) {
+        alert("記録中はモードを変更できません。先に停止してください。");
+        return;
+      }
+
+      currentMode = "evaluation";
+      resetGameState();
+      updateExperimentStatus("口形認識評価モード：障害物なし・時間無制限");
+    }
+
     function startExperiment(targetMouth) {
+      // 口形ごとの50回試行は評価モードで行う
+      if (currentMode !== "evaluation") {
+        currentMode = "evaluation";
+        resetGameState();
+      }
+
       experiment.participantId = participantInput.value.trim() || "P01";
       experiment.targetMouth = targetMouth;
       experiment.isRecording = true;
@@ -563,6 +623,18 @@
     // Update Game
     // ==================================================
     function updateGame(dt) {
+      // 口形判定とプレイヤー移動は、ゲームモード・評価モードの両方で常に行う
+      updateMouthState(dt);
+
+      playerX +=
+        (targetPlayerX - playerX) *
+        Math.min(1, dt * settings.playerMoveSpeed);
+
+      // 口形認識評価モードでは、障害物・コイン・終了判定を動かさない
+      if (currentMode === "evaluation") {
+        return;
+      }
+
       if (gameState !== "playing") return;
 
       elapsed += dt;
@@ -574,12 +646,6 @@
         spawnObstacleSet();
         spawnedCount++;
       }
-
-      updateMouthState(dt);
-
-      playerX +=
-        (targetPlayerX - playerX) *
-        Math.min(1, dt * settings.playerMoveSpeed);
 
       const playerY = getPlayerY();
 
@@ -644,11 +710,16 @@
       ctx.clearRect(0, 0, canvas.width, canvas.height);
 
       drawLanes();
-      drawObjects();
+
+      // 評価モードでは障害物・コインを描画しない
+      if (currentMode === "game") {
+        drawObjects();
+      }
+
       drawPlayer();
       drawUI();
 
-      if (gameState === "result") {
+      if (currentMode === "game" && gameState === "result") {
         drawResult();
       }
     }
@@ -744,12 +815,25 @@
       const x = canvas.width - 12;
       let y = isPortrait() ? 92 : 40;
 
-      const lines = [
-        `Avoid : ${successCount}/${settings.totalSets}`,
-        `Hit : ${hitCount}`,
-        `Coins : ${coinCount}`,
-        `Mouth : ${currentMouthState}`
-      ];
+      let lines;
+
+      if (currentMode === "evaluation") {
+        lines = [
+          `MODE : EVALUATION`,
+          `Target : ${experiment.targetMouth}`,
+          `Rows : ${experiment.rows.length}`,
+          `Mouth : ${currentMouthState}`,
+          `Lane : ${playerLane + 1}`
+        ];
+      } else {
+        lines = [
+          `MODE : GAME`,
+          `Avoid : ${successCount}/${settings.totalSets}`,
+          `Hit : ${hitCount}`,
+          `Coins : ${coinCount}`,
+          `Mouth : ${currentMouthState}`
+        ];
+      }
 
       for (const line of lines) {
         ctx.strokeText(line, x, y);
@@ -815,6 +899,8 @@
 
 
     // type="module" 内の関数をHTMLボタンから呼べるようにする
+    window.setGameMode = setGameMode;
+    window.setEvaluationMode = setEvaluationMode;
     window.startExperiment = startExperiment;
     window.stopExperiment = stopExperiment;
     window.sendExperimentToSheet = sendExperimentToSheet;
