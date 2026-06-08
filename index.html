@@ -27,8 +27,8 @@
       top: max(20px, env(safe-area-inset-top));
       left: 20px;
       transform: scaleX(-1);
-      width: 22vw;
-      max-width: 160px;
+      width: 24vw;
+      max-width: 130px;
       border: 2px solid white;
       border-radius: 8px;
       z-index: 10;
@@ -50,6 +50,91 @@
       z-index: 10;
       display: none;
     }
+
+    #experimentPanel {
+      position: fixed;
+      left: 12px;
+      right: 12px;
+      bottom: max(12px, env(safe-area-inset-bottom));
+      z-index: 30;
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 6px;
+      background: rgba(0,0,0,0.55);
+      padding: 8px;
+      border-radius: 10px;
+    }
+
+    #experimentPanel input,
+    #experimentPanel button {
+      font-size: 12px;
+      padding: 8px 6px;
+      border-radius: 6px;
+      border: 1px solid #ffffff;
+      min-height: 36px;
+    }
+
+    #experimentPanel input {
+      width: auto;
+      min-width: 0;
+    }
+
+    #experimentPanel button {
+      background: #222;
+      color: white;
+      font-weight: bold;
+    }
+
+    #experimentStatus {
+      position: fixed;
+      left: 12px;
+      bottom: calc(max(12px, env(safe-area-inset-bottom)) + 104px);
+      z-index: 30;
+      color: white;
+      background: rgba(0,0,0,0.7);
+      padding: 8px 10px;
+      border-radius: 8px;
+      font-size: 12px;
+      white-space: pre-line;
+    }
+
+    #conditionGuide {
+      position: fixed;
+      top: max(12px, env(safe-area-inset-top));
+      right: 12px;
+      z-index: 25;
+      color: white;
+      background: rgba(0,0,0,0.65);
+      padding: 8px 10px;
+      border-radius: 8px;
+      font-size: 12px;
+      line-height: 1.4;
+      text-align: right;
+      pointer-events: none;
+    }
+
+    #orientationOverlay {
+      position: fixed;
+      inset: 0;
+      z-index: 100;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+      color: white;
+      background: rgba(0,0,0,0.88);
+      font-size: 22px;
+      font-weight: bold;
+      line-height: 1.6;
+      padding: 24px;
+    }
+
+    @media (orientation: landscape) {
+      #orientationOverlay {
+        display: flex;
+      }
+    }
+
   </style>
 </head>
 
@@ -57,6 +142,22 @@
   <canvas id="gameCanvas"></canvas>
   <video id="webcamPreview" autoplay muted playsinline></video>
   <div id="debugText"></div>
+  <div id="conditionGuide">縦画面固定<br>端末は手持ち<br>顔から約50cm</div>
+  <div id="orientationOverlay">端末を縦向きにしてください<br>実験条件：手持ち・顔から約50cm</div>
+
+  <!-- 実験ログ操作パネル -->
+  <div id="experimentStatus">記録停止中</div>
+  <div id="experimentPanel">
+    <input id="participantInput" value="P01" aria-label="participant">
+    <button onclick="startExperiment('A')">A開始</button>
+    <button onclick="startExperiment('I')">I開始</button>
+    <button onclick="startExperiment('U')">U開始</button>
+    <button onclick="startExperiment('BE')">BE開始</button>
+    <button onclick="stopExperiment()">停止</button>
+    <button onclick="sendExperimentToSheet()">送信</button>
+    <button onclick="clearExperimentRows()">消去</button>
+  </div>
+
 
   <script type="module">
     import {
@@ -84,6 +185,8 @@
     let faceLandmarker;
     const video = document.getElementById("webcamPreview");
     const debugText = document.getElementById("debugText");
+    const experimentStatus = document.getElementById("experimentStatus");
+    const participantInput = document.getElementById("participantInput");
     let lastVideoTime = -1;
 
     let jaw = 0;
@@ -185,6 +288,22 @@
       coinCountPerSet: 3
     };
 
+
+    // ==================================================
+    // Experiment Logging / Google Sheets
+    // ==================================================
+    const GAS_URL = "https://script.google.com/macros/s/AKfycbyVxkETGBnOpcvK5bhJWLahEkmdsgrh8cRDfWPTnzMKh5CdT7e8RVV2DY0RLyUfMhOO/exec";
+
+    const experiment = {
+      participantId: "P01",
+      targetMouth: "A",
+      isRecording: false,
+      startTime: 0,
+      lastRecordTime: 0,
+      recordInterval: 0.100, // 10Hz：実験ログ用。縦画面スマホでの負荷とデータ量を抑える
+      rows: []
+    };
+
     const laneColors = [
       "#0072B2", // A
       "#D55E00", // I
@@ -225,9 +344,15 @@
     // ==================================================
     // Utility
     // ==================================================
+    function isPortrait() {
+      return canvas.height >= canvas.width;
+    }
+
     function getLaneX(index) {
       const w = canvas.width;
-      const margin = w * 0.12;
+
+      // 縦画面・手持ち前提：左右端に少し余白を残し、4レーンを均等配置
+      const margin = isPortrait() ? w * 0.10 : w * 0.12;
       const usable = w - margin * 2;
       const gap = usable / 3;
 
@@ -250,6 +375,112 @@
       targetPlayerX = getLaneX(lane);
       currentMouthState = state;
     }
+
+    function getPlayerY() {
+      // 縦画面では実験ボタンと重ならないよう少し上に配置
+      return canvas.height * (isPortrait() ? 0.72 : 0.82);
+    }
+
+
+    function updateExperimentStatus(message = null) {
+      if (!experimentStatus) return;
+
+      const state = experiment.isRecording ? "記録中" : "記録停止中";
+      const line1 = `${state} / Target: ${experiment.targetMouth} / Rows: ${experiment.rows.length}`;
+      experimentStatus.innerText = message ? `${line1}\n${message}` : line1;
+    }
+
+    function startExperiment(targetMouth) {
+      experiment.participantId = participantInput.value.trim() || "P01";
+      experiment.targetMouth = targetMouth;
+      experiment.isRecording = true;
+      experiment.startTime = performance.now();
+      experiment.lastRecordTime = 0;
+      experiment.rows = [];
+
+      updateExperimentStatus(`${targetMouth} の記録を開始`);
+      console.log("[Experiment Start]", experiment.participantId, targetMouth);
+    }
+
+    function stopExperiment() {
+      experiment.isRecording = false;
+      updateExperimentStatus("記録を停止");
+      console.log("[Experiment Stop]", experiment.rows.length);
+    }
+
+    function clearExperimentRows() {
+      if (experiment.isRecording) {
+        alert("記録中は消去できません。先に停止してください。");
+        return;
+      }
+
+      experiment.rows = [];
+      updateExperimentStatus("記録データを消去");
+    }
+
+    function recordExperimentRow() {
+      if (!experiment.isRecording) return;
+
+      const t = (performance.now() - experiment.startTime) / 1000;
+
+      if (t - experiment.lastRecordTime < experiment.recordInterval) {
+        return;
+      }
+
+      experiment.lastRecordTime = t;
+
+      experiment.rows.push({
+        time: t.toFixed(3),
+        jaw: jaw.toFixed(3),
+        smile: smile.toFixed(3),
+        pucker: pucker.toFixed(3),
+        recognizedMouth: currentMouthState,
+        lane: playerLane
+      });
+
+      if (experiment.rows.length % 30 === 0) {
+        updateExperimentStatus();
+      }
+    }
+
+    async function sendExperimentToSheet() {
+      if (experiment.isRecording) {
+        alert("記録中です。先に停止してください。");
+        return;
+      }
+
+      if (experiment.rows.length === 0) {
+        alert("送信するデータがありません。");
+        return;
+      }
+
+      experiment.participantId = participantInput.value.trim() || "P01";
+      updateExperimentStatus("Google Sheetsへ送信中...");
+
+      const payload = {
+        participant: experiment.participantId,
+        targetMouth: experiment.targetMouth,
+        rows: experiment.rows
+      };
+
+      try {
+        // Apps Script WebアプリはCORS応答を返せない場合があるため no-cors で送信する。
+        // no-corsでは返答内容は読めないが、送信自体は行われる。
+        await fetch(GAS_URL, {
+          method: "POST",
+          mode: "no-cors",
+          body: JSON.stringify(payload)
+        });
+
+        updateExperimentStatus("送信完了。Google Sheets側を確認してください。");
+        alert("送信しました。Google Sheetsを確認してください。");
+      } catch (error) {
+        console.error(error);
+        updateExperimentStatus("送信失敗");
+        alert("送信に失敗しました。通信環境とGAS URLを確認してください。");
+      }
+    }
+
 
     // ==================================================
     // Mouth Detection
@@ -350,7 +581,7 @@
         (targetPlayerX - playerX) *
         Math.min(1, dt * settings.playerMoveSpeed);
 
-      const playerY = canvas.height * 0.82;
+      const playerY = getPlayerY();
 
       // obstacles
       for (const set of obstacleSets) {
@@ -429,7 +660,7 @@
 
       for (let i = 0; i < 4; i++) {
         const x = getLaneX(i);
-        const laneW = canvas.width * 0.18;
+        const laneW = canvas.width * (isPortrait() ? 0.20 : 0.18);
 
         ctx.fillStyle = laneColors[i];
         ctx.globalAlpha = 0.25;
@@ -486,7 +717,7 @@
     }
 
     function drawPlayer() {
-      const y = canvas.height * 0.82;
+      const y = getPlayerY();
 
       ctx.fillStyle = "#ffffff";
       ctx.strokeStyle = "black";
@@ -505,13 +736,13 @@
 
     function drawUI() {
       ctx.textAlign = "right";
-      ctx.font = "bold 24px sans-serif";
+      ctx.font = isPortrait() ? "bold 18px sans-serif" : "bold 24px sans-serif";
       ctx.fillStyle = "white";
       ctx.strokeStyle = "black";
       ctx.lineWidth = 4;
 
-      const x = canvas.width - 20;
-      let y = 40;
+      const x = canvas.width - 12;
+      let y = isPortrait() ? 92 : 40;
 
       const lines = [
         `Avoid : ${successCount}/${settings.totalSets}`,
@@ -523,7 +754,7 @@
       for (const line of lines) {
         ctx.strokeText(line, x, y);
         ctx.fillText(line, x, y);
-        y += 34;
+        y += isPortrait() ? 26 : 34;
       }
     }
 
@@ -566,6 +797,7 @@
 
       updateMouthValues();
       updateGame(dt);
+      recordExperimentRow();
       drawGame();
 
       requestAnimationFrame(mainLoop);
@@ -581,12 +813,21 @@
         "\n\nスマホのカメラは HTTPS か localhost でないと起動できないことがあります。";
     }
 
+
+    // type="module" 内の関数をHTMLボタンから呼べるようにする
+    window.startExperiment = startExperiment;
+    window.stopExperiment = stopExperiment;
+    window.sendExperimentToSheet = sendExperimentToSheet;
+    window.clearExperimentRows = clearExperimentRows;
+
+
     // ==================================================
     // Start
     // ==================================================
     window.addEventListener("load", async () => {
       playerX = getLaneX(0);
       targetPlayerX = playerX;
+      updateExperimentStatus();
 
       try {
         await initMediaPipe();
